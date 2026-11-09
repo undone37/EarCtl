@@ -1,5 +1,6 @@
 //! Popup panel in the style of a macOS menu bar panel (egui).
-use crate::{Cmd, EQ, Sh, Status, anc, eq_bands, eq_name, lock, mode_name, tr};
+use crate::sony::{EQ, eq_name};
+use crate::{Act, Band, Cmd, Sh, Status, battery_text, lock, mode_name, tr};
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, FontId, Layout, RichText, Sense, Vec2,
     ViewportCommand,
@@ -7,13 +8,12 @@ use eframe::egui::{
 
 const ACCENT: Color32 = Color32::from_rgb(0x2f, 0x7c, 0xf6);
 const WIDTH: f32 = 320.0;
-const BANDS: [&str; 6] = ["Clear Bass", "400", "1k", "2.5k", "6.3k", "16k"];
 
 pub fn show(sh: Sh, tx: Cmd) -> Result<(), Box<dyn std::error::Error>> {
     let opts = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("sonyctl")
-            .with_app_id("sonyctl")
+            .with_title("earctl")
+            .with_app_id("earctl")
             .with_inner_size([WIDTH, 400.0])
             .with_decorations(false)
             .with_transparent(true)
@@ -22,7 +22,7 @@ pub fn show(sh: Sh, tx: Cmd) -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     eframe::run_native(
-        "sonyctl",
+        "earctl",
         opts,
         Box::new(move |cc| {
             lock(&sh).ctx = Some(cc.egui_ctx.clone());
@@ -46,12 +46,12 @@ struct Panel {
     eq_open: bool,
     // local copies so the device status doesn't overwrite sliders while dragging
     level: u8,
-    bands: Vec<i8>,
+    bands: Vec<Band>,
 }
 
 impl Panel {
     /// Send a command and optimistically update the shared status right away.
-    fn send(&self, p: Vec<u8>, f: impl FnOnce(&mut Status, &mut u8)) {
+    fn send(&self, act: Act, f: impl FnOnce(&mut Status, &mut u8)) {
         let mut g = lock(&self.sh);
         let mut amb = g.amb;
         if let Some(s) = &mut g.st {
@@ -59,31 +59,34 @@ impl Panel {
         }
         g.amb = amb;
         drop(g);
-        let _ = self.tx.send(p);
+        let _ = self.tx.send(act);
     }
 
-    fn body(&mut self, ui: &mut egui::Ui, s: &Status, amb: u8) {
-        let charging = if s.charging { " ⚡" } else { "" };
-        header(
-            ui,
-            tr("Verbunden", "Connected"),
-            Some(format!("{}%{charging}", s.bat)),
-        );
+    fn body(&mut self, ui: &mut egui::Ui, s: &Status) {
+        let mut sub = tr("Verbunden", "Connected").to_string();
+        if let Some((_, level)) = s.parts.iter().find(|p| p.0 == "Case") {
+            sub += &format!(" · Case {level}%");
+        }
+        header(ui, &s.name, &sub, Some(battery_text(s)));
         ui.separator();
 
         section(ui, tr("Geräuschsteuerung", "Noise Control"));
         for (i, icon) in [(2, "🔈"), (1, "👂"), (0, "🔇")] {
             if row(ui, icon, mode_name(i), None, s.mode == i).clicked() {
-                self.send(anc(i, s.voice, amb), |s, _| s.mode = i);
+                self.send(Act::Mode(i), |s, _| s.mode = i);
             }
-            if i == 1 && s.mode == 1 {
+            if i == 1 && s.mode == 1 && s.level.is_some() {
                 ui.horizontal(|ui| {
                     ui.add_space(44.0);
                     ui.spacing_mut().slider_width = WIDTH - 130.0;
                     let r = ui.add(egui::Slider::new(&mut self.level, 1..=20));
                     if r.drag_stopped() || (r.changed() && !r.dragged()) {
                         let l = self.level;
-                        self.send(anc(1, s.voice, l), |s, a| (s.level, *a) = (l, l));
+                        let act = Act::Ambient {
+                            level: Some(l),
+                            voice: None,
+                        };
+                        self.send(act, |s, a| (s.level, *a) = (Some(l), l));
                     }
                 });
                 if row(
@@ -91,11 +94,16 @@ impl Panel {
                     "🎤",
                     tr("Fokus auf Stimme", "Focus on Voice"),
                     None,
-                    s.voice,
+                    s.voice == Some(true),
                 )
                 .clicked()
                 {
-                    self.send(anc(1, !s.voice, amb), |s, _| s.voice = !s.voice);
+                    let v = s.voice != Some(true);
+                    let act = Act::Ambient {
+                        level: None,
+                        voice: Some(v),
+                    };
+                    self.send(act, |s, _| s.voice = Some(v));
                 }
             }
         }
@@ -104,27 +112,31 @@ impl Panel {
         if let Some(on) = s.stc
             && row(ui, "💬", "Speak-to-Chat", None, on).clicked()
         {
-            self.send(vec![0xf8, 0x05, 0x01, !on as u8], |s, _| s.stc = Some(!on));
+            self.send(Act::Stc(!on), |s, _| s.stc = Some(!on));
         }
         if let Some(on) = s.dsee
             && row(ui, "✨", "DSEE Extreme", None, on).clicked()
         {
-            self.send(vec![0xe8, 0x02, 0x00, !on as u8], |s, _| s.dsee = Some(!on));
+            self.send(Act::Dsee(!on), |s, _| s.dsee = Some(!on));
         }
-        if row(ui, "🎵", "Equalizer", Some(eq_name(s.eq)), self.eq_open).clicked() {
-            self.eq_open ^= true;
-        }
-        if self.eq_open {
-            self.equalizer(ui, s);
+        if s.eq.is_some() || !s.bands.is_empty() {
+            let sub = s.eq.map(eq_name);
+            if row(ui, "🎵", "Equalizer", sub, self.eq_open).clicked() {
+                self.eq_open ^= true;
+            }
+            if self.eq_open {
+                self.equalizer(ui, s.eq);
+            }
         }
         ui.separator();
 
         ui.horizontal(|ui| {
-            if ui
-                .button(tr("Kopfhörer ausschalten", "Turn off headphones"))
-                .clicked()
+            if s.power_off
+                && ui
+                    .button(tr("Kopfhörer ausschalten", "Turn off headphones"))
+                    .clicked()
             {
-                let _ = self.tx.send(vec![0x22, 0x00, 0x01]);
+                let _ = self.tx.send(Act::PowerOff);
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 if ui.button(tr("Beenden", "Quit")).clicked() {
@@ -134,47 +146,54 @@ impl Panel {
         });
     }
 
-    fn equalizer(&mut self, ui: &mut egui::Ui, s: &Status) {
-        ui.horizontal(|ui| {
-            ui.add_space(44.0);
-            egui::ComboBox::from_id_salt("eq")
-                .selected_text(eq_name(s.eq))
-                .width(WIDTH - 90.0)
-                .show_ui(ui, |ui| {
-                    for &(_, id, _) in EQ {
-                        if ui.selectable_label(s.eq == id, eq_name(id)).clicked() {
-                            self.send(vec![0x58, 0x01, id, 0x00], |s, _| s.eq = id);
+    fn equalizer(&mut self, ui: &mut egui::Ui, eq: Option<u8>) {
+        if let Some(eq) = eq {
+            ui.horizontal(|ui| {
+                ui.add_space(44.0);
+                egui::ComboBox::from_id_salt("eq")
+                    .selected_text(eq_name(eq))
+                    .width(WIDTH - 90.0)
+                    .show_ui(ui, |ui| {
+                        for &(_, id, _) in EQ {
+                            if ui.selectable_label(eq == id, eq_name(id)).clicked() {
+                                self.send(Act::EqPreset(id), |s, _| s.eq = Some(id));
+                            }
                         }
-                    }
-                });
-        });
-        if self.bands.len() != BANDS.len() {
+                    });
+            });
+        }
+        if self.bands.is_empty() {
             return; // device reports no bands (e.g. preset "Off")
         }
         ui.add_space(4.0);
         let mut changed = false;
-        ui.columns(BANDS.len(), |cols| {
-            for (i, ui) in cols.iter_mut().enumerate() {
+        ui.columns(self.bands.len(), |cols| {
+            for (b, ui) in self.bands.iter_mut().zip(cols) {
                 ui.vertical_centered(|ui| {
                     let r = ui.add(
-                        egui::Slider::new(&mut self.bands[i], -10..=10)
+                        egui::Slider::new(&mut b.gain, -b.max..=b.max)
+                            .step_by(b.step as f64)
                             .vertical()
                             .show_value(false),
                     );
                     changed |= r.drag_stopped() || (r.changed() && !r.dragged());
-                    ui.small(format!("{:+}", self.bands[i]));
-                    ui.small(BANDS[i]);
+                    ui.small(if b.step < 1.0 {
+                        format!("{:+.1}", b.gain)
+                    } else {
+                        format!("{:+.0}", b.gain)
+                    });
+                    ui.small(&b.label);
                 });
             }
         });
         if changed {
-            // bands apply to the active preset, so switch fixed presets to "Manual" first
-            let id = if s.eq >= 0xa0 { s.eq } else { 0xa0 };
-            if id != s.eq {
-                let _ = self.tx.send(vec![0x58, 0x01, id, 0x00]);
-            }
-            let b = self.bands.clone();
-            self.send(eq_bands(&b), move |s, _| (s.eq, s.bands) = (id, b));
+            // Sony: the driver switches fixed presets to "Manual" first, bands apply to the active one
+            let id = eq.map(|e| if e >= 0xa0 { e } else { 0xa0 });
+            let bands = self.bands.clone();
+            let gains = bands.iter().map(|b| b.gain).collect();
+            self.send(Act::EqBands(gains), move |s, _| {
+                (s.eq, s.bands) = (id, bands)
+            });
         }
     }
 }
@@ -214,9 +233,9 @@ impl eframe::App for Panel {
         let r = frame.show(ui, |ui| {
             ui.set_width(WIDTH - 30.0);
             match &st {
-                Some(s) => self.body(ui, s, amb),
+                Some(s) => self.body(ui, s),
                 None => {
-                    header(ui, tr("Nicht verbunden", "Not connected"), None);
+                    header(ui, "earctl", tr("Nicht verbunden", "Not connected"), None);
                     ui.separator();
                     if ui.button(tr("Beenden", "Quit")).clicked() {
                         std::process::exit(0);
@@ -234,11 +253,11 @@ impl eframe::App for Panel {
     }
 }
 
-fn header(ui: &mut egui::Ui, sub: &str, battery: Option<String>) {
+fn header(ui: &mut egui::Ui, name: &str, sub: &str, battery: Option<String>) {
     let r = ui.horizontal(|ui| {
         ui.label(RichText::new("🎧").size(30.0));
         ui.vertical(|ui| {
-            ui.label(RichText::new("WH-1000XM4").strong().size(16.0));
+            ui.label(RichText::new(name).strong().size(16.0));
             ui.label(RichText::new(sub).weak());
         });
         if let Some(b) = battery {

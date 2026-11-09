@@ -1,166 +1,16 @@
-//! sonyctl – controls Sony WH-1000XM3/XM4 on Linux via the MDR protocol
-//! (reconstructed from Sony Sound Connect 13.3.1: com.sony.songpal.tandemfamily.message.mdr.v1.table1).
-use bluer::rfcomm::{Profile, Role, Stream};
+//! earctl – controls Bluetooth headphones on Linux: noise cancelling, equalizer, battery and more.
+//! Drivers: Sony WH-1000XM3/XM4 (sony.rs) and Jabra Elite 10 (jabra.rs).
+use bluer::rfcomm::{Profile, Role};
 use futures::StreamExt;
+mod jabra;
 mod panel;
+mod sony;
 
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 
 type Res<T> = Result<T, Box<dyn std::error::Error>>;
-
-const UUID: bluer::Uuid = bluer::Uuid::from_u128(0x96CC203E_5068_46AD_B32D_E316F5E069BA);
-const DATA_MDR: u8 = 0x0c;
-const ACK: u8 = 0x01;
-
-/// 0x3E | kind seq len(u32 BE) payload sum | 0x3C, with 0x3C..0x3E escaped as 0x3D,(b & 0xEF).
-fn frame(kind: u8, seq: u8, payload: &[u8]) -> Vec<u8> {
-    let mut body = vec![kind, seq];
-    body.extend((payload.len() as u32).to_be_bytes());
-    body.extend(payload);
-    body.push(body.iter().fold(0u8, |a, b| a.wrapping_add(*b)));
-    let mut out = vec![0x3e];
-    for b in body {
-        if (0x3c..=0x3e).contains(&b) {
-            out.extend([0x3d, b & 0xef]);
-        } else {
-            out.push(b);
-        }
-    }
-    out.push(0x3c);
-    out
-}
-
-/// Frame content without start/end markers -> (kind, seq, payload).
-fn parse(raw: &[u8]) -> Option<(u8, u8, Vec<u8>)> {
-    let mut b = Vec::with_capacity(raw.len());
-    let mut it = raw.iter();
-    while let Some(&x) = it.next() {
-        b.push(if x == 0x3d { it.next()? | 0x10 } else { x });
-    }
-    let (body, sum) = b.split_at(b.len().checked_sub(1)?);
-    if body.len() < 6 || body.iter().fold(0u8, |a, x| a.wrapping_add(*x)) != sum[0] {
-        return None;
-    }
-    let len = u32::from_be_bytes(body[2..6].try_into().ok()?) as usize;
-    (body.len() == 6 + len).then(|| (body[0], body[1], body[6..].to_vec()))
-}
-
-struct Mdr {
-    s: Stream,
-    seq: u8,
-    buf: Vec<u8>,
-}
-
-impl Mdr {
-    async fn next_frame(&mut self) -> Res<(u8, u8, Vec<u8>)> {
-        loop {
-            if let Some(end) = self.buf.iter().position(|&b| b == 0x3c) {
-                let raw: Vec<u8> = self.buf.drain(..=end).collect();
-                let Some(st) = raw.iter().rposition(|&b| b == 0x3e) else {
-                    continue;
-                };
-                let Some(f) = parse(&raw[st + 1..raw.len() - 1]) else {
-                    continue;
-                };
-                if f.0 != ACK {
-                    self.s.write_all(&frame(ACK, 1 - (f.1 & 1), &[])).await?;
-                }
-                return Ok(f);
-            }
-            let mut tmp = [0u8; 1024];
-            let n = self.s.read(&mut tmp).await?;
-            if n == 0 {
-                return Err(tr("Verbindung geschlossen", "Connection closed").into());
-            }
-            self.buf.extend(&tmp[..n]);
-        }
-    }
-
-    /// Sends a command, waits for the ACK and (if `reply` is set) for the matching reply.
-    async fn send(&mut self, payload: &[u8], reply: Option<u8>) -> Res<Vec<u8>> {
-        self.s
-            .write_all(&frame(DATA_MDR, self.seq, payload))
-            .await?;
-        let wait = async {
-            let (mut acked, mut got) = (false, None);
-            loop {
-                let (kind, seq, p) = self.next_frame().await?;
-                if kind == ACK {
-                    acked = true;
-                    self.seq = seq;
-                } else if kind == DATA_MDR && reply.is_some() && p.first() == reply.as_ref() {
-                    got = Some(p);
-                }
-                if acked && (reply.is_none() || got.is_some()) {
-                    return Ok(got.unwrap_or_default());
-                }
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(3), wait)
-            .await
-            .map_err(|_| {
-                format!(
-                    "{} 0x{:02x}",
-                    tr("Timeout bei Befehl", "Timeout on command"),
-                    payload[0]
-                )
-            })?
-    }
-}
-
-async fn connect() -> Res<(Mdr, bluer::rfcomm::ProfileHandle)> {
-    let session = bluer::Session::new().await?;
-    let adapter = session.default_adapter().await?;
-    let mut dev = None;
-    for addr in adapter.device_addresses().await? {
-        let d = adapter.device(addr)?;
-        // ponytail: first connected WH-1000XM* device; add an address option once someone has several
-        if d.is_connected().await? && d.name().await?.is_some_and(|n| n.contains("1000XM")) {
-            dev = Some(d);
-            break;
-        }
-    }
-    let dev = dev.ok_or(tr(
-        "Kein verbundener WH-1000XM* gefunden",
-        "No connected WH-1000XM* found",
-    ))?;
-    let mut handle = session
-        .register_profile(Profile {
-            uuid: UUID,
-            role: Some(Role::Client),
-            require_authentication: Some(false),
-            require_authorization: Some(false),
-            auto_connect: Some(false),
-            ..Default::default()
-        })
-        .await?;
-    let d = dev.clone();
-    let conn = tokio::spawn(async move { d.connect_profile(&UUID).await });
-    let req = tokio::time::timeout(Duration::from_secs(10), handle.next())
-        .await
-        .map_err(|_| {
-            tr(
-                "Timeout beim Verbinden (Kopfhörer an und verbunden?)",
-                "Timeout while connecting (headphones on and connected?)",
-            )
-        })?
-        .ok_or(tr("Profil geschlossen", "Profile closed"))?;
-    let s = req.accept()?;
-    conn.await??;
-    let mut m = Mdr {
-        s,
-        seq: 0,
-        buf: vec![],
-    };
-    // CONNECT_GET_PROTOCOL_INFO; right after a reconnect the XM4 sometimes ignores the first attempt
-    if m.send(&[0x00, 0x00], Some(0x01)).await.is_err() {
-        m.seq ^= 1;
-        m.send(&[0x00, 0x00], Some(0x01)).await?;
-    }
-    Ok((m, handle))
-}
 
 /// German if the locale is "de", English otherwise.
 static GERMAN: LazyLock<bool> = LazyLock::new(|| {
@@ -174,38 +24,6 @@ fn tr(de: &'static str, en: &'static str) -> &'static str {
     if *GERMAN { de } else { en }
 }
 
-/// (CLI name, ID, display name)
-const EQ: &[(&str, u8, &str)] = &[
-    ("off", 0x00, "Off"),
-    ("rock", 0x01, "Rock"),
-    ("pop", 0x02, "Pop"),
-    ("jazz", 0x03, "Jazz"),
-    ("dance", 0x04, "Dance"),
-    ("edm", 0x05, "EDM"),
-    ("rnb", 0x06, "R&B / Hip-Hop"),
-    ("acoustic", 0x07, "Acoustic"),
-    ("bright", 0x10, "Bright"),
-    ("excited", 0x11, "Excited"),
-    ("mellow", 0x12, "Mellow"),
-    ("relaxed", 0x13, "Relaxed"),
-    ("vocal", 0x14, "Vocal"),
-    ("treble", 0x15, "Treble Boost"),
-    ("bass", 0x16, "Bass Boost"),
-    ("speech", 0x17, "Speech"),
-    ("custom", 0xa0, "Manual"),
-    ("user1", 0xa1, "Custom 1"),
-    ("user2", 0xa2, "Custom 2"),
-    ("user3", 0xa3, "Custom 3"),
-];
-
-fn eq_name(id: u8) -> &'static str {
-    match EQ.iter().find(|p| p.1 == id) {
-        Some((_, 0, _)) => tr("Aus", "Off"),
-        Some(p) => p.2,
-        None => "?",
-    }
-}
-
 /// Mode index: 0 = noise cancelling, 1 = ambient sound, 2 = off
 fn mode_name(i: usize) -> &'static str {
     [
@@ -215,196 +33,325 @@ fn mode_name(i: usize) -> &'static str {
     ][i]
 }
 
-#[derive(Clone, Debug)]
+/// Headline battery: the earbuds if the device reports them separately, otherwise the single level.
+fn battery_text(s: &Status) -> String {
+    let buds: Vec<String> = s
+        .parts
+        .iter()
+        .filter(|p| p.0 != "Case")
+        .map(|(n, l)| format!("{} {l}%", &n[..1]))
+        .collect();
+    let charging = if s.charging { " ⚡" } else { "" };
+    if buds.is_empty() {
+        format!("{}%{charging}", s.bat)
+    } else {
+        buds.join(" · ") + charging
+    }
+}
+
+/// One equalizer band; gains go from -max to +max in `step`s.
+#[derive(Clone, Debug, Default)]
+struct Band {
+    label: String,
+    gain: f32,
+    max: f32,
+    step: f32,
+}
+
+/// Device state; `None`/empty fields are features the device doesn't have.
+#[derive(Clone, Debug, Default)]
 struct Status {
+    name: String,
     bat: u8,
     charging: bool,
+    /// extra batteries, e.g. left/right earbud and case
+    parts: Vec<(&'static str, u8)>,
     mode: usize,
-    voice: bool,
-    level: u8,
-    eq: u8,
-    bands: Vec<i8>,
+    voice: Option<bool>,
+    /// ambient level 1..20
+    level: Option<u8>,
+    /// Sony equalizer preset
+    eq: Option<u8>,
+    bands: Vec<Band>,
     dsee: Option<bool>,
     stc: Option<bool>,
+    power_off: bool,
 }
 
-async fn status(m: &mut Mdr) -> Res<Status> {
-    let b = m.send(&[0x10, 0x00], Some(0x11)).await?;
-    let n = m.send(&[0x66, 0x02], Some(0x67)).await?;
-    let e = m.send(&[0x56, 0x01], Some(0x57)).await?;
-    let dsee = m
-        .send(&[0xe6, 0x02], Some(0xe7))
-        .await
-        .ok()
-        .map(|d| d[3] == 1);
-    let stc = m
-        .send(&[0xf6, 0x05], Some(0xf7))
-        .await
-        .ok()
-        .map(|d| d[3] == 1);
-    Ok(Status {
-        bat: b[2],
-        charging: b[3] == 1,
-        mode: if n[2] == 0 {
-            2
-        } else if n[4] != 0 {
-            0
-        } else {
-            1
-        },
-        voice: n[6] == 1,
-        level: n[7],
-        eq: e[2],
-        bands: e[4..].iter().map(|&v| v as i8 - 10).collect(),
-        dsee,
-        stc,
-    })
+/// Something the user wants to change, independent of the device protocol.
+#[derive(Clone, Debug)]
+enum Act {
+    Mode(usize),
+    Ambient {
+        level: Option<u8>,
+        voice: Option<bool>,
+    },
+    EqPreset(u8),
+    EqBands(Vec<f32>),
+    Dsee(bool),
+    Stc(bool),
+    AutoOff(u8, u8),
+    PowerOff,
 }
 
-/// NCASM_SET_PARAM: NC+ASM, effect, DUAL_SINGLE_OFF, nc, LEVEL_ADJUSTMENT, asmId, level
-fn anc(mode: usize, voice: bool, level: u8) -> Vec<u8> {
-    let (effect, nc) = match mode {
-        0 => (0x11, 0x02),
-        1 => (0x11, 0x00),
-        _ => (0x00, 0x00),
-    };
-    // the XM4 reports level 0 in NC mode -> use full level instead of "silent" when switching to ambient
-    let level = if mode == 1 && level == 0 {
-        20
+enum Link {
+    Sony(sony::Mdr),
+    Jabra(jabra::Gnp),
+}
+
+struct Dev {
+    name: String,
+    link: Link,
+}
+
+impl Dev {
+    async fn status(&mut self) -> Res<Status> {
+        let mut s = match &mut self.link {
+            Link::Sony(m) => m.status().await?,
+            Link::Jabra(g) => g.status().await?,
+        };
+        s.name = self.name.clone();
+        Ok(s)
+    }
+
+    async fn apply(&mut self, act: &Act, cur: &Status, amb: u8) -> Res<()> {
+        match &mut self.link {
+            Link::Sony(m) => m.apply(act, cur, amb).await,
+            Link::Jabra(g) => g.apply(act).await,
+        }
+    }
+
+    /// Waits for an unsolicited message, e.g. after a button press on the headphones.
+    async fn event(&mut self) -> Res<()> {
+        match &mut self.link {
+            Link::Sony(m) => drop(m.next_frame().await?),
+            Link::Jabra(g) => drop(g.next().await?),
+        }
+        Ok(())
+    }
+
+    async fn raw(&mut self, p: &[u8]) -> Res<Vec<u8>> {
+        match &mut self.link {
+            Link::Sony(m) => m.raw(p).await,
+            Link::Jabra(g) => g.raw(p).await,
+        }
+    }
+
+    /// Disconnect cleanly, otherwise an immediate reconnect hangs.
+    async fn close(&mut self) -> Res<()> {
+        match &mut self.link {
+            Link::Sony(m) => m.s.shutdown().await?,
+            Link::Jabra(g) => g.s.shutdown().await?,
+        }
+        Ok(())
+    }
+}
+
+/// Which driver handles a device, by its Bluetooth name.
+fn driver(name: &str) -> Option<bluer::Uuid> {
+    if name.contains("1000XM") {
+        Some(sony::UUID)
+    } else if name.starts_with("Jabra Elite") {
+        Some(jabra::UUID)
     } else {
-        level.min(20)
+        None
+    }
+}
+
+async fn connect() -> Res<(Dev, bluer::rfcomm::ProfileHandle)> {
+    let session = bluer::Session::new().await?;
+    let adapter = session.default_adapter().await?;
+    // ponytail: first connected supported device; EARCTL_DEVICE picks one by name until the tray handles several
+    let want = std::env::var("EARCTL_DEVICE").unwrap_or_default();
+    let mut found = None;
+    for addr in adapter.device_addresses().await? {
+        let d = adapter.device(addr)?;
+        let Some(name) = d.name().await? else {
+            continue;
+        };
+        if let Some(uuid) = driver(&name)
+            && name.contains(&want)
+            && d.is_connected().await?
+        {
+            found = Some((d, name, uuid));
+            break;
+        }
+    }
+    let (dev, name, uuid) = found.ok_or(tr(
+        "Keine unterstützten verbundenen Kopfhörer gefunden",
+        "No supported connected headphones found",
+    ))?;
+    let mut handle = session
+        .register_profile(Profile {
+            uuid,
+            role: Some(Role::Client),
+            require_authentication: Some(false),
+            require_authorization: Some(false),
+            auto_connect: Some(false),
+            ..Default::default()
+        })
+        .await?;
+    let d = dev.clone();
+    let conn = tokio::spawn(async move { d.connect_profile(&uuid).await });
+    let req = tokio::time::timeout(Duration::from_secs(10), handle.next())
+        .await
+        .map_err(|_| {
+            tr(
+                "Timeout beim Verbinden (Kopfhörer an und verbunden?)",
+                "Timeout while connecting (headphones on and connected?)",
+            )
+        })?
+        .ok_or(tr("Profil geschlossen", "Profile closed"))?;
+    let s = req.accept()?;
+    conn.await??;
+    let link = if uuid == sony::UUID {
+        Link::Sony(sony::Mdr::open(s).await?)
+    } else {
+        Link::Jabra(jabra::Gnp::new(s))
     };
-    vec![0x68, 0x02, effect, 0x02, nc, 0x01, voice as u8, level]
+    Ok((Dev { name, link }, handle))
 }
 
-/// EQ_SET_PARAM with bands [ClearBass, 400, 1k, 2.5k, 6.3k, 16k] in -10..10.
-/// Like the app: preset ID UNSPECIFIED (0xFF), the bands apply to the active preset.
-/// With a concrete ID the XM4 silently drops the message.
-fn eq_bands(bands: &[i8]) -> Vec<u8> {
-    let mut p = vec![0x58, 0x01, 0xff, bands.len() as u8];
-    p.extend(bands.iter().map(|b| (b.clamp(&-10, &10) + 10) as u8));
-    p
-}
-
-const USAGE: &str = "sonyctl                         tray icon + panel (runs in background)
-sonyctl status
-sonyctl anc nc|off
-sonyctl anc ambient [1-20] [voice]
-sonyctl eq <preset>             (off rock pop jazz dance edm rnb acoustic bright excited
+const USAGE: &str = "earctl                         tray icon + panel (runs in background)
+earctl status
+earctl anc nc|off
+earctl anc ambient [1-20] [voice]
+earctl eq <preset>             (off rock pop jazz dance edm rnb acoustic bright excited
                                  mellow relaxed vocal treble bass speech custom user1-3)
-sonyctl eq custom <clearbass> <400> <1k> <2.5k> <6.3k> <16k>   (-10..10 each)
-sonyctl dsee on|off
-sonyctl stc on|off              (Speak-to-Chat)
-sonyctl autooff 5|30|60|180|removed|off
-sonyctl poweroff
-sonyctl raw <hex bytes>         (send payload, wait for reply code+1)";
+earctl eq <preset> <clearbass> <400> <1k> <2.5k> <6.3k> <16k>   (Sony, -10..10 each)
+earctl eq <gain> <gain> ...     (bands of the active preset; Jabra: dB, see status)
+earctl dsee on|off
+earctl stc on|off              (Speak-to-Chat)
+earctl autooff 5|30|60|180|removed|off
+earctl poweroff
+earctl raw <hex bytes>         (Sony: MDR payload; Jabra: type cmd payload)
 
-fn onoff(a: Option<&str>) -> Res<u8> {
+EARCTL_DEVICE=<name part> picks a device when several are connected.";
+
+fn onoff(a: Option<&str>) -> Res<bool> {
     match a {
-        Some("on") => Ok(1),
-        Some("off") => Ok(0),
+        Some("on") => Ok(true),
+        Some("off") => Ok(false),
         _ => Err(USAGE.into()),
     }
 }
 
+fn print_status(s: &Status) {
+    let onoff = |b: bool| if b { tr("an", "on") } else { tr("aus", "off") };
+    let charging = if s.charging {
+        tr(" (lädt)", " (charging)")
+    } else {
+        ""
+    };
+    println!("{:<14}{}", tr("Gerät:", "Device:"), s.name);
+    if s.parts.is_empty() {
+        println!("{:<14}{}%{charging}", tr("Akku:", "Battery:"), s.bat);
+    }
+    for (name, level) in &s.parts {
+        println!("{:<14}{level}%{charging}", format!("{name}:"));
+    }
+    println!("{:<14}{}", "ANC:", mode_name(s.mode));
+    if let Some(level) = s.level {
+        let voice = if s.voice == Some(true) {
+            tr(" +Stimme", " +voice")
+        } else {
+            ""
+        };
+        println!("{:<14}{level}{voice}", tr("Umgebung:", "Ambient:"));
+    }
+    if s.eq.is_some() || !s.bands.is_empty() {
+        let preset =
+            s.eq.map_or(String::new(), |e| format!("{} ", sony::eq_name(e)));
+        let bands: Vec<String> = s
+            .bands
+            .iter()
+            .map(|b| format!("{} {:+}", b.label, b.gain))
+            .collect();
+        println!("{:<14}{preset}{}", "EQ:", bands.join(" | "));
+    }
+    if let Some(on) = s.dsee {
+        println!("{:<14}{}", "DSEE:", onoff(on));
+    }
+    if let Some(on) = s.stc {
+        println!("{:<14}{}", "Speak-to-Chat:", onoff(on));
+    }
+}
+
 async fn run(a: &[&str]) -> Res<()> {
-    let (mut m, _profile) = connect().await?;
+    let (mut d, _profile) = connect().await?;
     let arg = a.get(1).copied();
-    match a[0] {
+    let act = match a[0] {
         "status" => {
-            let s = status(&mut m).await?;
-            let opt = |o: Option<bool>| {
-                o.map_or("?", |b| if b { tr("an", "on") } else { tr("aus", "off") })
-            };
-            let charging = if s.charging {
-                tr(" (lädt)", " (charging)")
-            } else {
-                ""
-            };
-            println!("{:<14}{}%{charging}", tr("Akku:", "Battery:"), s.bat);
-            println!("{:<14}{}", "ANC:", mode_name(s.mode));
-            println!(
-                "{:<14}{}{}",
-                tr("Umgebung:", "Ambient:"),
-                s.level,
-                if s.voice {
-                    tr(" +Stimme", " +voice")
-                } else {
-                    ""
-                }
-            );
-            println!("{:<14}{} {:?}", "EQ:", eq_name(s.eq), s.bands);
-            println!("{:<14}{}", "DSEE:", opt(s.dsee));
-            println!("{:<14}{}", "Speak-to-Chat:", opt(s.stc));
+            print_status(&d.status().await?);
+            None
         }
-        "anc" => {
-            let s = status(&mut m).await?;
-            let p = match arg {
-                Some("nc") => anc(0, s.voice, s.level),
-                Some("off") => anc(2, s.voice, s.level),
-                Some("ambient") => {
-                    let level = a.get(2).and_then(|l| l.parse().ok()).unwrap_or(s.level);
-                    anc(1, a.contains(&"voice"), level)
-                }
-                _ => return Err(USAGE.into()),
-            };
-            m.send(&p, None).await?;
-        }
+        "anc" => Some(match arg {
+            Some("nc") => Act::Mode(0),
+            Some("off") => Act::Mode(2),
+            Some("ambient") => Act::Ambient {
+                level: a.get(2).and_then(|l| l.parse().ok()),
+                voice: Some(a.contains(&"voice")),
+            },
+            _ => return Err(USAGE.into()),
+        }),
+        // numbers only: set the bands of the active preset (Jabra: dB per band)
+        "eq" if arg.is_some_and(|v| v.parse::<f32>().is_ok()) => Some(Act::EqBands(
+            a[1..].iter().map(|v| v.parse()).collect::<Result<_, _>>()?,
+        )),
         "eq" => {
-            let id = EQ.iter().find(|p| Some(p.0) == arg).ok_or(USAGE)?.1;
-            m.send(&[0x58, 0x01, id, 0x00], None).await?;
-            if a.len() > 2 {
-                if a.len() != 8 {
-                    return Err(USAGE.into());
-                }
-                let bands = a[2..]
-                    .iter()
-                    .map(|v| v.parse())
-                    .collect::<Result<Vec<i8>, _>>()?;
-                m.send(&eq_bands(&bands), None).await?;
+            let id = sony::EQ.iter().find(|p| Some(p.0) == arg).ok_or(USAGE)?.1;
+            let cur = d.status().await?;
+            d.apply(&Act::EqPreset(id), &cur, 0).await?;
+            match a.len() {
+                2 => None,
+                8 => Some(Act::EqBands(
+                    a[2..].iter().map(|v| v.parse()).collect::<Result<_, _>>()?,
+                )),
+                _ => return Err(USAGE.into()),
             }
         }
-        "dsee" => drop(m.send(&[0xe8, 0x02, 0x00, onoff(arg)?], None).await?),
-        "stc" => drop(m.send(&[0xf8, 0x05, 0x01, onoff(arg)?], None).await?),
-        "autooff" => {
-            // ponytail: value pairs taken from Gadgetbridge; the XM4 may only support off/removed
-            let (x, y) = match arg {
-                Some("5") => (0x00, 0x00),
-                Some("30") => (0x01, 0x01),
-                Some("60") => (0x02, 0x02),
-                Some("180") => (0x03, 0x03),
-                Some("removed") => (0x10, 0x00),
-                Some("off") => (0x11, 0x00),
-                _ => return Err(USAGE.into()),
-            };
-            m.send(&[0xf8, 0x04, 0x01, x, y], None).await?;
-        }
-        "poweroff" => drop(m.send(&[0x22, 0x00, 0x01], None).await?),
+        "dsee" => Some(Act::Dsee(onoff(arg)?)),
+        "stc" => Some(Act::Stc(onoff(arg)?)),
+        // ponytail: value pairs taken from Gadgetbridge; the XM4 may only support off/removed
+        "autooff" => Some(match arg {
+            Some("5") => Act::AutoOff(0x00, 0x00),
+            Some("30") => Act::AutoOff(0x01, 0x01),
+            Some("60") => Act::AutoOff(0x02, 0x02),
+            Some("180") => Act::AutoOff(0x03, 0x03),
+            Some("removed") => Act::AutoOff(0x10, 0x00),
+            Some("off") => Act::AutoOff(0x11, 0x00),
+            _ => return Err(USAGE.into()),
+        }),
+        "poweroff" => Some(Act::PowerOff),
         "raw" => {
             let p = a[1..]
                 .iter()
                 .map(|h| u8::from_str_radix(h, 16))
                 .collect::<Result<Vec<_>, _>>()?;
-            let r = m.send(&p, Some(p.first().ok_or(USAGE)? + 1)).await?;
-            println!("{r:02x?}");
+            println!("{:02x?}", d.raw(&p).await?);
+            None
         }
         _ => return Err(USAGE.into()),
+    };
+    if let Some(act) = act {
+        let cur = d.status().await?;
+        let amb = cur.level.filter(|&l| l > 0).unwrap_or(20);
+        d.apply(&act, &cur, amb).await?;
     }
-    m.s.shutdown().await?; // disconnect cleanly, otherwise an immediate reconnect hangs
-    Ok(())
+    d.close().await
 }
 
 /// State shared by the Bluetooth thread, the tray and the panel.
 #[derive(Default)]
 struct Shared {
     st: Option<Status>,
-    /// last ambient level, the device reports 0 in NC mode
+    /// last ambient level, Sony reports 0 while in NC mode
     amb: u8,
     /// open panel, so it repaints on new data
     ctx: Option<eframe::egui::Context>,
 }
 type Sh = Arc<Mutex<Shared>>;
-type Cmd = tokio::sync::mpsc::UnboundedSender<Vec<u8>>;
+type Cmd = tokio::sync::mpsc::UnboundedSender<Act>;
 
 fn lock(sh: &Sh) -> std::sync::MutexGuard<'_, Shared> {
     sh.lock().unwrap_or_else(|e| e.into_inner())
@@ -417,17 +364,20 @@ struct Tray {
 }
 
 impl Tray {
-    fn cmd(&self, p: Vec<u8>) {
-        let _ = self.tx.send(p);
+    fn title(&self) -> String {
+        lock(&self.sh)
+            .st
+            .as_ref()
+            .map_or_else(|| "earctl".into(), |s| s.name.clone())
     }
 }
 
 impl ksni::Tray for Tray {
     fn id(&self) -> String {
-        "sonyctl".into()
+        "earctl".into()
     }
     fn title(&self) -> String {
-        "WH-1000XM4".into()
+        Tray::title(self)
     }
     fn icon_name(&self) -> String {
         "audio-headphones".into()
@@ -447,15 +397,15 @@ impl ksni::Tray for Tray {
     fn tool_tip(&self) -> ksni::ToolTip {
         let description = match &lock(&self.sh).st {
             Some(s) => format!(
-                "{} {}% · {}",
+                "{} {} · {}",
                 tr("Akku", "Battery"),
-                s.bat,
+                battery_text(s),
                 mode_name(s.mode)
             ),
             None => tr("Nicht verbunden", "Not connected").into(),
         };
         ksni::ToolTip {
-            title: "WH-1000XM4".into(),
+            title: Tray::title(self),
             description,
             ..Default::default()
         }
@@ -471,10 +421,6 @@ impl ksni::Tray for Tray {
             }
             .into()
         };
-        let (st, amb) = {
-            let g = lock(&self.sh);
-            (g.st.clone(), g.amb)
-        };
         let mut items = vec![item(
             tr("Panel öffnen", "Open panel"),
             "audio-headphones",
@@ -482,13 +428,14 @@ impl ksni::Tray for Tray {
                 let _ = t.open.send(());
             },
         )];
-        if let Some(s) = st {
-            let voice = s.voice;
+        if let Some(s) = &lock(&self.sh).st {
             items.push(MenuItem::Separator);
             items.push(
                 RadioGroup {
                     selected: s.mode,
-                    select: Box::new(move |t: &mut Self, i| t.cmd(anc(i, voice, amb))),
+                    select: Box::new(|t: &mut Self, i| {
+                        let _ = t.tx.send(Act::Mode(i));
+                    }),
                     options: (0..3)
                         .map(|i| RadioItem {
                             label: mode_name(i).into(),
@@ -513,7 +460,7 @@ impl ksni::Tray for Tray {
 async fn bt_loop(
     sh: Sh,
     tx: Cmd,
-    mut rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<Act>,
     open: std::sync::mpsc::Sender<()>,
 ) -> Res<()> {
     use ksni::TrayMethods;
@@ -528,9 +475,9 @@ async fn bt_loop(
         let mut g = lock(&sh);
         if let Some(s) = &st
             && s.mode == 1
-            && s.level > 0
+            && let Some(l) = s.level.filter(|&l| l > 0)
         {
-            g.amb = s.level;
+            g.amb = l;
         }
         g.st = st;
         if let Some(c) = &g.ctx {
@@ -542,15 +489,21 @@ async fn bt_loop(
         if let Err(e) = &conn {
             eprintln!("{e}");
         }
-        if let Ok((mut m, _profile)) = conn {
+        if let Ok((mut d, _profile)) = conn {
             let err: Res<()> = async {
                 loop {
-                    publish(Some(status(&mut m).await?));
+                    let cur = d.status().await?;
+                    publish(Some(cur.clone()));
                     handle.update(|_| {}).await;
                     tokio::select! {
-                        Some(p) = rx.recv() => drop(m.send(&p, None).await?),
-                        // buttons on the headphones send NTFY frames -> re-read the status
-                        f = m.next_frame() => drop(f?),
+                        Some(act) = rx.recv() => {
+                            let amb = lock(&sh).amb;
+                            if let Err(e) = d.apply(&act, &cur, amb).await {
+                                eprintln!("{e}");
+                            }
+                        }
+                        // buttons on the headphones send events -> re-read the status
+                        e = d.event() => e?,
                         _ = tokio::time::sleep(Duration::from_secs(60)) => {}
                     }
                 }
@@ -611,25 +564,5 @@ fn main() {
     if let Err(e) = res {
         eprintln!("{e}");
         std::process::exit(1);
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn framing() {
-        // ACK frame from the APK (rm0.b): {62, 1, 0, 0,0,0,0, 1, 60}
-        assert_eq!(frame(ACK, 0, &[]), [0x3e, 1, 0, 0, 0, 0, 0, 1, 0x3c]);
-        // escaping + roundtrip
-        let p = [0x68, 0x3c, 0x3d, 0x3e, 0x00];
-        let f = frame(DATA_MDR, 1, &p);
-        assert!(!f[1..f.len() - 1].iter().any(|b| *b == 0x3c || *b == 0x3e));
-        assert_eq!(parse(&f[1..f.len() - 1]), Some((DATA_MDR, 1, p.to_vec())));
-        // broken checksum
-        let mut bad = f.clone();
-        bad[2] ^= 1;
-        assert_eq!(parse(&bad[1..bad.len() - 1]), None);
     }
 }

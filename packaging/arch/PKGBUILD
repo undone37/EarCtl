@@ -1,6 +1,6 @@
 # Builds from the repo checkout (two levels up), not from a tarball.
 # ponytail: AUR would need source=(…tar.gz) + sha256sums, add when publishing there
-pkgname=sonyctl
+pkgname=earctl
 pkgver=0
 pkgrel=1
 pkgdesc="Sony WH-1000XM3/XM4 Einstellungen unter Linux (Tray + CLI)"
@@ -23,8 +23,8 @@ build() {
 
 package() {
   cd "$(_root)"
-  install -Dm755 target/release/sonyctl "$pkgdir/usr/bin/sonyctl"
-  install -Dm644 sonyctl.desktop "$pkgdir/usr/share/applications/sonyctl.desktop"
-  install -Dm644 sonyctl.desktop "$pkgdir/etc/xdg/autostart/sonyctl.desktop"
+  install -Dm755 target/release/earctl "$pkgdir/usr/bin/earctl"
+  install -Dm644 earctl.desktop "$pkgdir/usr/share/applications/earctl.desktop"
+  install -Dm644 earctl.desktop "$pkgdir/etc/xdg/autostart/earctl.desktop"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

@@ -858,6 +858,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8b14ccef22fc6f5a8f4d7d768562a182c04ce9a3b3157b91390b52ddfdf1a76"
 
 [[package]]
+name = "earctl"
+version = "0.1.0"
+dependencies = [
+ "bluer",
+ "eframe",
+ "futures",
+ "ksni",
+ "tokio",
+]
+
+[[package]]
 name = "ecolor"
 version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2985,17 +2996,6 @@ checksum = "c3d1e2c7f27f8d4cb10542a02c49005dbd6e93095799d6f3be745fae9f8fedd4"
 dependencies = [
  "libc",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "sonyctl"
-version = "0.1.0"
-dependencies = [
- "bluer",
- "eframe",
- "futures",
- "ksni",
- "tokio",
 ]
 
 [[package]]
