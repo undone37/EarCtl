@@ -1,7 +1,14 @@
 [Desktop Entry]
 Type=Application
-Name=sonyctl
-Comment=Sony WH-1000XM4 Einstellungen im Tray
+Name=Sony Headphone Control
+Name[de]=Sony-Kopfhörersteuerung
+GenericName=Headphone Settings
+GenericName[de]=Kopfhörer-Einstellungen
+Comment=Control noise cancelling, equalizer and more on Sony WH-1000XM4 headphones
+Comment[de]=Noise Cancelling, Equalizer und mehr für Sony WH-1000XM4 Kopfhörer einstellen
 Exec=sonyctl
 Icon=audio-headphones
+Categories=Settings;HardwareSettings;
+Keywords=sony;headphones;bluetooth;anc;equalizer;
+Keywords[de]=sony;kopfhörer;bluetooth;anc;equalizer;
 X-KDE-autostart-after=panel

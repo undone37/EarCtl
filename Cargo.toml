@@ -17,7 +17,8 @@ ksni = "0.3.7"
 tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "time", "sync"] }
 
 [package.metadata.deb]
-# GUI-Libs werden per dlopen geladen, $auto findet sie nicht
+license-file = ["LICENSE", "0"]
+# GUI libs are loaded via dlopen, $auto can't see them
 depends = "$auto, bluez, libxkbcommon0, libegl1, libwayland-client0, libwayland-egl1, libx11-6, libxcursor1, libxrandr2, libxi6"
 assets = [
     ["target/release/sonyctl", "usr/bin/", "755"],
@@ -30,6 +31,7 @@ assets = [
     { source = "target/release/sonyctl", dest = "/usr/bin/sonyctl", mode = "755" },
     { source = "sonyctl.desktop", dest = "/usr/share/applications/sonyctl.desktop", mode = "644" },
     { source = "sonyctl.desktop", dest = "/etc/xdg/autostart/sonyctl.desktop", mode = "644" },
+    { source = "LICENSE", dest = "/usr/share/licenses/sonyctl/LICENSE", mode = "644", doc = true },
 ]
 
 [package.metadata.generate-rpm.requires]

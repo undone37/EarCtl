@@ -48,7 +48,7 @@ jobs:
     steps:
       - run: pacman -Syu --noconfirm --needed base-devel git
       - uses: actions/checkout@v4
-      # makepkg verweigert root; -s installiert die Abhängigkeiten aus dem PKGBUILD per sudo
+      # makepkg refuses to run as root; -s installs the PKGBUILD dependencies via sudo
       - run: |
           useradd -m builder
           echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/builder

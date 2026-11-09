@@ -1,4 +1,4 @@
-//! Popup-Panel im Stil eines macOS-Menüleisten-Panels (egui).
+//! Popup panel in the style of a macOS menu bar panel (egui).
 use crate::{Cmd, EQ, Sh, Status, anc, eq_bands, eq_name, lock, mode_name, tr};
 use eframe::egui::{
     self, Align, Align2, Color32, CursorIcon, FontId, Layout, RichText, Sense, Vec2,
@@ -44,13 +44,13 @@ struct Panel {
     tx: Cmd,
     focused: bool,
     eq_open: bool,
-    // lokale Kopien, damit Slider beim Ziehen nicht vom Gerätestatus überschrieben werden
+    // local copies so the device status doesn't overwrite sliders while dragging
     level: u8,
     bands: Vec<i8>,
 }
 
 impl Panel {
-    /// Befehl senden und den geteilten Status sofort optimistisch anpassen.
+    /// Send a command and optimistically update the shared status right away.
     fn send(&self, p: Vec<u8>, f: impl FnOnce(&mut Status, &mut u8)) {
         let mut g = lock(&self.sh);
         let mut amb = g.amb;
@@ -149,7 +149,7 @@ impl Panel {
                 });
         });
         if self.bands.len() != BANDS.len() {
-            return; // Gerät meldet keine Bänder (z. B. Preset "Off")
+            return; // device reports no bands (e.g. preset "Off")
         }
         ui.add_space(4.0);
         let mut changed = false;
@@ -168,7 +168,7 @@ impl Panel {
             }
         });
         if changed {
-            // Bänder gelten fürs aktive Preset, feste Presets vorher auf "Manual" umstellen
+            // bands apply to the active preset, so switch fixed presets to "Manual" first
             let id = if s.eq >= 0xa0 { s.eq } else { 0xa0 };
             if id != s.eq {
                 let _ = self.tx.send(vec![0x58, 0x01, id, 0x00]);
@@ -181,12 +181,12 @@ impl Panel {
 
 impl eframe::App for Panel {
     fn clear_color(&self, _: &egui::Visuals) -> [f32; 4] {
-        [0.0; 4] // transparent, damit die runden Ecken sichtbar sind
+        [0.0; 4] // transparent so the rounded corners show
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
-        // Popup-Verhalten: schließt bei Fokusverlust oder Esc
+        // popup behaviour: close on focus loss or Esc
         match ctx.input(|i| i.viewport().focused) {
             Some(true) => self.focused = true,
             Some(false) if self.focused => ctx.send_viewport_cmd(ViewportCommand::Close),
@@ -225,7 +225,7 @@ impl eframe::App for Panel {
             }
         });
 
-        // Fenster an den Inhalt anpassen (EQ auf/zu)
+        // fit the window to its content (EQ expanded/collapsed)
         let want = r.response.rect.size();
         let have = ctx.input(|i| i.viewport().inner_rect.map(|r| r.size()));
         if have.is_none_or(|h| (h - want).length() > 1.0) {
@@ -247,7 +247,7 @@ fn header(ui: &mut egui::Ui, sub: &str, battery: Option<String>) {
             });
         }
     });
-    // nur die Kopfzeile verschiebt das Fenster, sonst schnappt sie Slidern die Maus weg
+    // only the header moves the window, otherwise it steals the mouse from sliders
     if r.response.interact(Sense::drag()).drag_started() {
         ui.ctx().send_viewport_cmd(ViewportCommand::StartDrag);
     }
@@ -257,7 +257,7 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.label(RichText::new(title).small().strong().weak());
 }
 
-/// Zeile mit rundem Icon-Button wie im macOS-Kontrollzentrum.
+/// Row with a round icon button, like the macOS Control Center.
 fn row(ui: &mut egui::Ui, icon: &str, label: &str, sub: Option<&str>, on: bool) -> egui::Response {
     let (rect, resp) =
         ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), Sense::click());

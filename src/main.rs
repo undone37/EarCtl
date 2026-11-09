@@ -1,5 +1,5 @@
-//! sonyctl – steuert Sony WH-1000XM3/XM4 unter Linux über das MDR-Protokoll
-//! (aus Sony Sound Connect 13.3.1 rekonstruiert: com.sony.songpal.tandemfamily.message.mdr.v1.table1).
+//! sonyctl – controls Sony WH-1000XM3/XM4 on Linux via the MDR protocol
+//! (reconstructed from Sony Sound Connect 13.3.1: com.sony.songpal.tandemfamily.message.mdr.v1.table1).
 use bluer::rfcomm::{Profile, Role, Stream};
 use futures::StreamExt;
 mod panel;
@@ -14,7 +14,7 @@ const UUID: bluer::Uuid = bluer::Uuid::from_u128(0x96CC203E_5068_46AD_B32D_E316F
 const DATA_MDR: u8 = 0x0c;
 const ACK: u8 = 0x01;
 
-/// 0x3E | kind seq len(u32 BE) payload sum | 0x3C, mit 0x3C..0x3E escaped als 0x3D,(b & 0xEF).
+/// 0x3E | kind seq len(u32 BE) payload sum | 0x3C, with 0x3C..0x3E escaped as 0x3D,(b & 0xEF).
 fn frame(kind: u8, seq: u8, payload: &[u8]) -> Vec<u8> {
     let mut body = vec![kind, seq];
     body.extend((payload.len() as u32).to_be_bytes());
@@ -32,7 +32,7 @@ fn frame(kind: u8, seq: u8, payload: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Frame-Inhalt ohne Start/Ende-Marker -> (kind, seq, payload).
+/// Frame content without start/end markers -> (kind, seq, payload).
 fn parse(raw: &[u8]) -> Option<(u8, u8, Vec<u8>)> {
     let mut b = Vec::with_capacity(raw.len());
     let mut it = raw.iter();
@@ -78,7 +78,7 @@ impl Mdr {
         }
     }
 
-    /// Sendet einen Befehl, wartet auf ACK und (falls `reply`) auf die passende Antwort.
+    /// Sends a command, waits for the ACK and (if `reply` is set) for the matching reply.
     async fn send(&mut self, payload: &[u8], reply: Option<u8>) -> Res<Vec<u8>> {
         self.s
             .write_all(&frame(DATA_MDR, self.seq, payload))
@@ -116,7 +116,7 @@ async fn connect() -> Res<(Mdr, bluer::rfcomm::ProfileHandle)> {
     let mut dev = None;
     for addr in adapter.device_addresses().await? {
         let d = adapter.device(addr)?;
-        // ponytail: erstes gekoppeltes WH-1000XM*-Gerät; Adress-Option erst bei mehreren Kopfhörern
+        // ponytail: first connected WH-1000XM* device; add an address option once someone has several
         if d.is_connected().await? && d.name().await?.is_some_and(|n| n.contains("1000XM")) {
             dev = Some(d);
             break;
@@ -154,7 +154,7 @@ async fn connect() -> Res<(Mdr, bluer::rfcomm::ProfileHandle)> {
         seq: 0,
         buf: vec![],
     };
-    // CONNECT_GET_PROTOCOL_INFO; direkt nach einem Reconnect ignoriert der XM4 den ersten Versuch manchmal
+    // CONNECT_GET_PROTOCOL_INFO; right after a reconnect the XM4 sometimes ignores the first attempt
     if m.send(&[0x00, 0x00], Some(0x01)).await.is_err() {
         m.seq ^= 1;
         m.send(&[0x00, 0x00], Some(0x01)).await?;
@@ -162,7 +162,7 @@ async fn connect() -> Res<(Mdr, bluer::rfcomm::ProfileHandle)> {
     Ok((m, handle))
 }
 
-/// Deutsch, wenn die Locale auf "de" steht, sonst Englisch.
+/// German if the locale is "de", English otherwise.
 static GERMAN: LazyLock<bool> = LazyLock::new(|| {
     ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
@@ -174,7 +174,7 @@ fn tr(de: &'static str, en: &'static str) -> &'static str {
     if *GERMAN { de } else { en }
 }
 
-/// (CLI-Name, ID, Anzeigename)
+/// (CLI name, ID, display name)
 const EQ: &[(&str, u8, &str)] = &[
     ("off", 0x00, "Off"),
     ("rock", 0x01, "Rock"),
@@ -206,7 +206,7 @@ fn eq_name(id: u8) -> &'static str {
     }
 }
 
-/// Modus-Index: 0 = Noise Cancelling, 1 = Umgebung, 2 = Aus
+/// Mode index: 0 = noise cancelling, 1 = ambient sound, 2 = off
 fn mode_name(i: usize) -> &'static str {
     [
         "Noise Cancelling",
@@ -268,7 +268,7 @@ fn anc(mode: usize, voice: bool, level: u8) -> Vec<u8> {
         1 => (0x11, 0x00),
         _ => (0x00, 0x00),
     };
-    // im NC-Modus meldet der XM4 Stufe 0 -> beim Wechsel auf Umgebung volle Stufe statt "stumm"
+    // the XM4 reports level 0 in NC mode -> use full level instead of "silent" when switching to ambient
     let level = if mode == 1 && level == 0 {
         20
     } else {
@@ -277,9 +277,9 @@ fn anc(mode: usize, voice: bool, level: u8) -> Vec<u8> {
     vec![0x68, 0x02, effect, 0x02, nc, 0x01, voice as u8, level]
 }
 
-/// EQ_SET_PARAM mit Bändern [ClearBass, 400, 1k, 2.5k, 6.3k, 16k] in -10..10.
-/// Wie die App: Preset-ID UNSPECIFIED (0xFF), die Bänder gelten fürs aktive Preset.
-/// Mit konkreter ID verwirft der XM4 die Nachricht kommentarlos.
+/// EQ_SET_PARAM with bands [ClearBass, 400, 1k, 2.5k, 6.3k, 16k] in -10..10.
+/// Like the app: preset ID UNSPECIFIED (0xFF), the bands apply to the active preset.
+/// With a concrete ID the XM4 silently drops the message.
 fn eq_bands(bands: &[i8]) -> Vec<u8> {
     let mut p = vec![0x58, 0x01, 0xff, bands.len() as u8];
     p.extend(bands.iter().map(|b| (b.clamp(&-10, &10) + 10) as u8));
@@ -367,7 +367,7 @@ async fn run(a: &[&str]) -> Res<()> {
         "dsee" => drop(m.send(&[0xe8, 0x02, 0x00, onoff(arg)?], None).await?),
         "stc" => drop(m.send(&[0xf8, 0x05, 0x01, onoff(arg)?], None).await?),
         "autooff" => {
-            // ponytail: Wertepaare wie Gadgetbridge; XM4 unterstützt evtl. nur off/removed
+            // ponytail: value pairs taken from Gadgetbridge; the XM4 may only support off/removed
             let (x, y) = match arg {
                 Some("5") => (0x00, 0x00),
                 Some("30") => (0x01, 0x01),
@@ -390,17 +390,17 @@ async fn run(a: &[&str]) -> Res<()> {
         }
         _ => return Err(USAGE.into()),
     }
-    m.s.shutdown().await?; // sauber trennen, sonst hängt ein direkt folgender Reconnect
+    m.s.shutdown().await?; // disconnect cleanly, otherwise an immediate reconnect hangs
     Ok(())
 }
 
-/// Zustand, den Bluetooth-Thread, Tray und Panel teilen.
+/// State shared by the Bluetooth thread, the tray and the panel.
 #[derive(Default)]
 struct Shared {
     st: Option<Status>,
-    /// letzte Umgebungsstufe, das Gerät meldet im NC-Modus 0
+    /// last ambient level, the device reports 0 in NC mode
     amb: u8,
-    /// offenes Panel, damit es bei neuen Daten neu zeichnet
+    /// open panel, so it repaints on new data
     ctx: Option<eframe::egui::Context>,
 }
 type Sh = Arc<Mutex<Shared>>;
@@ -432,12 +432,12 @@ impl ksni::Tray for Tray {
     fn icon_name(&self) -> String {
         "audio-headphones".into()
     }
-    /// Linksklick öffnet das Panel, Rechtsklick das Menü.
+    /// Left click opens the panel, right click the menu.
     fn activate(&mut self, _x: i32, _y: i32) {
         let _ = self.open.send(());
     }
     fn status(&self) -> ksni::Status {
-        // getrennt: Icon wandert in KDEs "ausgeblendete Symbole"
+        // disconnected: the icon moves to KDE's hidden icons
         if lock(&self.sh).st.is_some() {
             ksni::Status::Active
         } else {
@@ -509,7 +509,7 @@ impl ksni::Tray for Tray {
     }
 }
 
-/// Hält die Verbindung, liest den Status und führt Befehle aus Tray/Panel aus.
+/// Keeps the connection, reads the status and runs commands from the tray/panel.
 async fn bt_loop(
     sh: Sh,
     tx: Cmd,
@@ -549,7 +549,7 @@ async fn bt_loop(
                     handle.update(|_| {}).await;
                     tokio::select! {
                         Some(p) = rx.recv() => drop(m.send(&p, None).await?),
-                        // Tasten am Kopfhörer schicken NTFY-Frames -> Status neu lesen
+                        // buttons on the headphones send NTFY frames -> re-read the status
                         f = m.next_frame() => drop(f?),
                         _ = tokio::time::sleep(Duration::from_secs(60)) => {}
                     }
@@ -564,7 +564,7 @@ async fn bt_loop(
         }
         publish(None);
         handle.update(|_| {}).await;
-        while rx.try_recv().is_ok() {} // Klicks während der Trennung verwerfen
+        while rx.try_recv().is_ok() {} // drop clicks made while disconnected
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
@@ -576,7 +576,7 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
-/// Tray im Hintergrund-Thread, Panel-Fenster (egui) im Hauptthread – winit will den Hauptthread.
+/// Tray on a background thread, panel window (egui) on the main thread, which winit requires.
 fn gui() -> Res<()> {
     let sh = Sh::default();
     lock(&sh).amb = 20;
@@ -590,7 +590,7 @@ fn gui() -> Res<()> {
         }
     });
     while open_rx.recv().is_ok() {
-        while open_rx.try_recv().is_ok() {} // Doppelklicks zusammenfassen
+        while open_rx.try_recv().is_ok() {} // collapse double clicks
         panel::show(sh.clone(), tx.clone())?;
         lock(&sh).ctx = None;
     }
@@ -620,14 +620,14 @@ mod tests {
 
     #[test]
     fn framing() {
-        // ACK-Frame aus der APK (rm0.b): {62, 1, 0, 0,0,0,0, 1, 60}
+        // ACK frame from the APK (rm0.b): {62, 1, 0, 0,0,0,0, 1, 60}
         assert_eq!(frame(ACK, 0, &[]), [0x3e, 1, 0, 0, 0, 0, 0, 1, 0x3c]);
-        // Escaping + Roundtrip
+        // escaping + roundtrip
         let p = [0x68, 0x3c, 0x3d, 0x3e, 0x00];
         let f = frame(DATA_MDR, 1, &p);
         assert!(!f[1..f.len() - 1].iter().any(|b| *b == 0x3c || *b == 0x3e));
         assert_eq!(parse(&f[1..f.len() - 1]), Some((DATA_MDR, 1, p.to_vec())));
-        // kaputte Checksumme
+        // broken checksum
         let mut bad = f.clone();
         bad[2] ^= 1;
         assert_eq!(parse(&bad[1..bad.len() - 1]), None);
