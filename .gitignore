@@ -1,0 +1,6 @@
+/target
+*.xapk
+*.apk
+packaging/arch/*.pkg.tar.zst
+packaging/arch/src/
+packaging/arch/pkg/

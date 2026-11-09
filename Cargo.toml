@@ -1,0 +1,44 @@
+[package]
+name = "sonyctl"
+version = "0.1.0"
+edition = "2024"
+description = "Sony WH-1000XM3/XM4 Einstellungen unter Linux (Tray + CLI)"
+license = "MIT"
+
+[profile.release]
+strip = true
+lto = true
+
+[dependencies]
+bluer = { version = "0.17.4", features = ["bluetoothd", "rfcomm"] }
+eframe = { version = "0.35.0", default-features = false, features = ["accesskit", "default_fonts", "glow", "wayland", "x11"] }
+futures = "0.3.34"
+ksni = "0.3.7"
+tokio = { version = "1.54.1", features = ["rt", "macros", "io-util", "time", "sync"] }
+
+[package.metadata.deb]
+# GUI-Libs werden per dlopen geladen, $auto findet sie nicht
+depends = "$auto, bluez, libxkbcommon0, libegl1, libwayland-client0, libwayland-egl1, libx11-6, libxcursor1, libxrandr2, libxi6"
+assets = [
+    ["target/release/sonyctl", "usr/bin/", "755"],
+    ["sonyctl.desktop", "usr/share/applications/", "644"],
+    ["sonyctl.desktop", "etc/xdg/autostart/", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/sonyctl", dest = "/usr/bin/sonyctl", mode = "755" },
+    { source = "sonyctl.desktop", dest = "/usr/share/applications/sonyctl.desktop", mode = "644" },
+    { source = "sonyctl.desktop", dest = "/etc/xdg/autostart/sonyctl.desktop", mode = "644" },
+]
+
+[package.metadata.generate-rpm.requires]
+bluez = "*"
+libxkbcommon = "*"
+libglvnd-egl = "*"
+libwayland-client = "*"
+libwayland-egl = "*"
+libX11 = "*"
+libXcursor = "*"
+libXrandr = "*"
+libXi = "*"

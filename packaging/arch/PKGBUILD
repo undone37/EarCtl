@@ -1,0 +1,29 @@
+# Baut aus dem Repo-Checkout (zwei Ebenen höher), nicht aus einem Tarball.
+# ponytail: für AUR bräuchte es source=(…tar.gz) + sha256sums, erst wenn es dort hin soll
+pkgname=sonyctl
+pkgver=0
+pkgrel=1
+pkgdesc="Sony WH-1000XM3/XM4 Einstellungen unter Linux (Tray + CLI)"
+arch=('x86_64')
+license=('MIT')
+depends=('dbus' 'bluez' 'gcc-libs' 'glibc' 'libxkbcommon' 'libglvnd' 'wayland' 'libx11' 'libxcursor' 'libxrandr' 'libxi')
+makedepends=('cargo')
+options=('!lto' '!debug')
+
+_root() { realpath "$startdir/../.."; }
+
+pkgver() {
+  grep -m1 '^version' "$(_root)/Cargo.toml" | cut -d'"' -f2
+}
+
+build() {
+  cd "$(_root)"
+  cargo build --release --locked
+}
+
+package() {
+  cd "$(_root)"
+  install -Dm755 target/release/sonyctl "$pkgdir/usr/bin/sonyctl"
+  install -Dm644 sonyctl.desktop "$pkgdir/usr/share/applications/sonyctl.desktop"
+  install -Dm644 sonyctl.desktop "$pkgdir/etc/xdg/autostart/sonyctl.desktop"
+}

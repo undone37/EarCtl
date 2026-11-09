@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=sonyctl
+Comment=Sony WH-1000XM4 Einstellungen im Tray
+Exec=sonyctl
+Icon=audio-headphones
+X-KDE-autostart-after=panel
