@@ -33,7 +33,9 @@ fn eq_bands(d: &[u8]) -> Vec<Band> {
     let n = d.get(1).copied().unwrap_or(0) as usize;
     d.get(4..)
         .unwrap_or(&[])
-        .chunks_exact(7)
+        .as_chunks::<7>()
+        .0
+        .iter()
         .take(n)
         .map(|r| {
             let hz = u16::from_be_bytes([r[1], r[2]]) as f32 / 3.0;
@@ -54,7 +56,7 @@ fn eq_bands(d: &[u8]) -> Vec<Band> {
 /// Write payload: [7d, count, 0, d[2], d[3]] + per band [freq, gain, last 2 bytes], from the last read.
 fn eq_write(d: &[u8], gains: &[f32]) -> Vec<u8> {
     let mut p = vec![EQ, d[1], 0, d[2], d[3]];
-    for (r, g) in d[4..].chunks_exact(7).zip(gains) {
+    for (r, g) in d[4..].as_chunks::<7>().0.iter().zip(gains) {
         let max = r[0] as f32 / 4.0;
         let g = (g.clamp(-max, max) * 60.0).round() as i16;
         p.extend([r[1], r[2]]);
@@ -95,7 +97,7 @@ fn battery(d: &[u8]) -> (u8, bool, Vec<(&'static str, u8)>) {
     let mut parts = vec![];
     if flags & 0x80 != 0 {
         let n = d.get(5).copied().unwrap_or(0) as usize;
-        for u in d.get(6..).unwrap_or(&[]).chunks_exact(3).take(n) {
+        for u in d.get(6..).unwrap_or(&[]).as_chunks::<3>().0.iter().take(n) {
             let name = match u[0] {
                 0x04 => tr("Rechts", "Right"),
                 0x05 => tr("Links", "Left"),
